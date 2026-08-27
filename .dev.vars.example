@@ -1,0 +1,9 @@
+# Copy this file to `.dev.vars` (gitignored) for local `wrangler dev` runs.
+# Real Vocably project values already live in the Flutter repo's own
+# `.env` (tools/vocab_import) — copy the same OPENAI_API_KEY here so both
+# the import pipeline and this Worker call the same account during dev.
+#
+# In production, this is never a file — it's set with:
+#   npx wrangler secret put OPENAI_API_KEY
+
+OPENAI_API_KEY=sk-1a3a558fc811bdd93ba78f565bbba1751fe92478d5589e38

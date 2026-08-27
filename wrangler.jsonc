@@ -1,0 +1,64 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "vocably-ai-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-09-23",
+
+  // Non-secret config. `OPENAI_API_KEY` itself is NOT here — it's a
+  // secret, set via `npx wrangler secret put OPENAI_API_KEY` for the
+  // deployed Worker, or `.dev.vars` (gitignored, see .dev.vars.example)
+  // for `wrangler dev`.
+  //
+  // Reusing the same OpenAI-compatible endpoint/model already proven by
+  // the Flutter repo's `tools/vocab_import` pipeline (DATA_MODEL.md §10),
+  // per the project owner's explicit decision.
+  "vars": {
+    "OPENAI_BASE_URL": "https://ai.dinoiki.com/v1",
+    "OPENAI_API_PATH": "/chat/completions",
+    "OPENAI_MODEL": "gpt-4o-mini",
+    "FIREBASE_PROJECT_ID": "vocably-idn-en",
+    // Comma-separated allowlist (DATA_MODEL.md §10.1). Production only —
+    // localhost is added under `env.development` below, never here, so a
+    // plain `wrangler deploy` can never accidentally accept a dev origin.
+    "ALLOWED_ORIGINS": "https://vocably-idn-en.web.app,https://vocably-idn-en.firebaseapp.com"
+  },
+
+  // Used by `wrangler dev --env development` (see package.json's "dev"
+  // script) — adds the fixed local Flutter dev port (CLAUDE.md §2:
+  // `flutter run -d chrome --web-port=5555`) to the allowlist. Never used
+  // by `wrangler deploy`, which reads the top-level `vars` above instead.
+  "env": {
+    "development": {
+      "vars": {
+        "OPENAI_BASE_URL": "https://ai.dinoiki.com/v1",
+        "OPENAI_API_PATH": "/chat/completions",
+        "OPENAI_MODEL": "gpt-4o-mini",
+        "FIREBASE_PROJECT_ID": "vocably-idn-en",
+        "ALLOWED_ORIGINS": "https://vocably-idn-en.web.app,https://vocably-idn-en.firebaseapp.com,http://localhost:5555"
+      }
+    }
+  }
+
+  // --- Native rate limiting (DATA_MODEL.md §10.1) ---
+  // Left out for now: it's uncertain whether the Rate Limiting binding is
+  // available on the Workers Free plan (couldn't be confirmed from
+  // Cloudflare's docs during planning). The code in src/rateLimit.ts
+  // auto-detects this binding and falls back to a zero-cost in-memory
+  // per-isolate limiter when it's absent — see that file's doc comment.
+  //
+  // Once you've confirmed Rate Limiting is available on your account's
+  // plan, add this block as a top-level sibling of "vars"/"env" above
+  // (no code changes needed — the fallback switches itself off
+  // automatically once the binding exists):
+  //
+  //   "unsafe": {
+  //     "bindings": [
+  //       {
+  //         "name": "RATE_LIMITER",
+  //         "type": "ratelimit",
+  //         "namespace_id": "1001",
+  //         "simple": { "limit": 30, "period": 60 }
+  //       }
+  //     ]
+  //   }
+}

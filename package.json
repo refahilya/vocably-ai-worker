@@ -1,0 +1,23 @@
+{
+  "name": "vocably-ai-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker AI proxy for Vocably (Milestone 5, CLAUDE.md §2/§7, DATA_MODEL.md §10). Separate codebase from the Flutter app — hides OPENAI_API_KEY from the web client; never writes to Firestore.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --env development",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "jose": "^6.2.10"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.1.1",
+    "@cloudflare/workers-types": "^5.20260827.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.127.0"
+  }
+}
