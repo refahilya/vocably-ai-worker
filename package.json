@@ -5,7 +5,7 @@
   "description": "Cloudflare Worker AI proxy for Vocably (Milestone 5, CLAUDE.md §2/§7, DATA_MODEL.md §10). Separate codebase from the Flutter app — hides OPENAI_API_KEY from the web client; never writes to Firestore.",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --env development",
+    "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

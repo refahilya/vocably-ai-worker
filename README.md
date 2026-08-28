@@ -34,7 +34,7 @@ runtime).
 
 ```bash
 npm install
-npm run dev        # wrangler dev --env development
+npm run dev        # wrangler dev
 ```
 
 Copy `.dev.vars.example` to `.dev.vars` (gitignored) first, filling in a
@@ -43,10 +43,14 @@ Flutter repo's root `.env` for `tools/vocab_import`, since both call the
 same Dinoiki OpenAI-compatible account (`https://ai.dinoiki.com/v1`,
 `gpt-4o-mini`), per the project owner's decision.
 
-`npm run dev` uses the `development` environment in `wrangler.jsonc`,
-which is the **only** place `http://localhost:5555` (the Flutter repo's
-fixed dev port, `CLAUDE.md` §2) is in the CORS allowlist — a plain
-`wrangler deploy` never includes it.
+`http://localhost:5555` (the Flutter repo's fixed dev port, `CLAUDE.md`
+§2) is in `wrangler.jsonc`'s single `vars.ALLOWED_ORIGINS` list alongside
+the two production Firebase Hosting origins — see that file's comment
+for why (a real end-to-end test found that local Flutter dev actually
+points at the *deployed* Worker, not a locally-running `wrangler dev`
+one, so localhost needs to be allowed on the real deployment too, not
+just a separate dev-only config that a plain `wrangler deploy` never
+reads).
 
 Point the Flutter client at this local server:
 

@@ -6,4 +6,4 @@
 # In production, this is never a file — it's set with:
 #   npx wrangler secret put OPENAI_API_KEY
 
-OPENAI_API_KEY=sk-1a3a558fc811bdd93ba78f565bbba1751fe92478d5589e38
+OPENAI_API_KEY=sk-replace-with-real-key

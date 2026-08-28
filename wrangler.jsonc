@@ -17,26 +17,28 @@
     "OPENAI_API_PATH": "/chat/completions",
     "OPENAI_MODEL": "gpt-4o-mini",
     "FIREBASE_PROJECT_ID": "vocably-idn-en",
-    // Comma-separated allowlist (DATA_MODEL.md §10.1). Production only —
-    // localhost is added under `env.development` below, never here, so a
-    // plain `wrangler deploy` can never accidentally accept a dev origin.
-    "ALLOWED_ORIGINS": "https://vocably-idn-en.web.app,https://vocably-idn-en.firebaseapp.com"
-  },
-
-  // Used by `wrangler dev --env development` (see package.json's "dev"
-  // script) — adds the fixed local Flutter dev port (CLAUDE.md §2:
-  // `flutter run -d chrome --web-port=5555`) to the allowlist. Never used
-  // by `wrangler deploy`, which reads the top-level `vars` above instead.
-  "env": {
-    "development": {
-      "vars": {
-        "OPENAI_BASE_URL": "https://ai.dinoiki.com/v1",
-        "OPENAI_API_PATH": "/chat/completions",
-        "OPENAI_MODEL": "gpt-4o-mini",
-        "FIREBASE_PROJECT_ID": "vocably-idn-en",
-        "ALLOWED_ORIGINS": "https://vocably-idn-en.web.app,https://vocably-idn-en.firebaseapp.com,http://localhost:5555"
-      }
-    }
+    // Comma-separated allowlist (DATA_MODEL.md §10.1) — a fixed, explicit
+    // list of exact origins, never a wildcard, so this stays safe to
+    // deploy as-is.
+    //
+    // Corrected after a real end-to-end test: this used to be prod-only,
+    // with `http://localhost:5555` added under a separate `env.development`
+    // block on the assumption that local Flutter dev would always talk to
+    // a *locally-running* `wrangler dev` Worker. In practice, the actual
+    // dev workflow points the local Flutter client straight at this
+    // deployed Worker (`--dart-define=WORKER_BASE_URL=https://vocably-ai-
+    // worker.<subdomain>.workers.dev`) — and a plain `wrangler deploy`
+    // only ever reads these top-level `vars`, never `env.development`'s.
+    // So the deployed Worker's allowlist genuinely didn't include
+    // localhost, and correctly rejected it (missing
+    // `Access-Control-Allow-Origin` on the OPTIONS preflight, which is
+    // exactly the browser error this fixes) — not a bug in the origin-
+    // matching code itself (`src/cors.ts` was, and still is, unchanged).
+    // Fix: `http://localhost:5555` now lives directly in this one list,
+    // which is what's actually live. It's a single fixed origin, not a
+    // pattern/wildcard, so this doesn't open the Worker to arbitrary
+    // origins — anything not in this exact list is still rejected.
+    "ALLOWED_ORIGINS": "https://vocably-idn-en.web.app,https://vocably-idn-en.firebaseapp.com,http://localhost:5555"
   }
 
   // --- Native rate limiting (DATA_MODEL.md §10.1) ---
@@ -47,9 +49,9 @@
   // per-isolate limiter when it's absent — see that file's doc comment.
   //
   // Once you've confirmed Rate Limiting is available on your account's
-  // plan, add this block as a top-level sibling of "vars"/"env" above
-  // (no code changes needed — the fallback switches itself off
-  // automatically once the binding exists):
+  // plan, add this block as a top-level sibling of "vars" above (no code
+  // changes needed — the fallback switches itself off automatically once
+  // the binding exists):
   //
   //   "unsafe": {
   //     "bindings": [
