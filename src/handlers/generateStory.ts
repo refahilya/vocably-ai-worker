@@ -52,7 +52,10 @@ interface GenerateStoryResult {
  * same word (see that function's own doc comment for why a code-level
  * morphology check was deliberately rejected). This is prompt-only,
  * enforced by instruction alone, same as the sentence-count strengthening
- * above.
+ * Pedagogical fix: removed the "in the same order the target words were
+ * given" constraint. Instructed the model to choose target-word order
+ * based on natural, logical narrative flow, preventing positional cues
+ * from leaking into the Cloze Test.
  */
 function buildSystemPrompt(wordCount: number): string {
   const sentenceWord = wordCount === 1 ? 'sentence' : 'sentences';
@@ -60,7 +63,7 @@ function buildSystemPrompt(wordCount: number): string {
 
 You will receive a list of English target words (base form) and a short prompt/title, which may be written in any language (e.g. Indonesian).
 
-Write ONE short story in English with EXACTLY ${wordCount} ${sentenceWord} — no more, no fewer. Count your sentences before answering. One target word goes in each sentence, in the same order the target words were given.
+Write ONE short story in English with EXACTLY ${wordCount} ${sentenceWord} — no more, no fewer. Count your sentences before answering. Exactly one target word goes in each sentence. Choose the order of target words that creates the most natural, logical, and coherent narrative flow; do NOT follow the target-word list order simply because of the order they were provided.
 
 Write for a beginner-to-intermediate EFL learner, not a native speaker: use simple, common, everyday vocabulary (avoid advanced or rare words, unless one of them is a target word itself); prefer simple sentence structures with one main idea per sentence, avoiding unnecessary subordinate/relative clauses and avoiding stuffing multiple ideas into a single sentence. A sentence may still be a normal, natural length when that's genuinely needed for the meaning — the goal is clarity and naturalness for a learner, not artificially short or choppy sentences.
 

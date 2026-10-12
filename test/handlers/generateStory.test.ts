@@ -329,8 +329,43 @@ describe('handleGenerateStory', () => {
         const prompt = await capturedSystemPrompt();
         expect(prompt).toMatch(/\[\[baby\|girl\]\] is WRONG/i);
       });
+
+      it('does NOT instruct the model to use target words in the same order as given', async () => {
+        const prompt = await capturedSystemPrompt();
+        expect(prompt).not.toMatch(/in the same order/i);
+      });
+
+      it('instructs the model to arrange target words according to natural narrative flow and not follow list order', async () => {
+        const prompt = await capturedSystemPrompt(2);
+        expect(prompt).toMatch(/natural, logical, and coherent narrative flow/i);
+        expect(prompt).toMatch(/do NOT follow the target-word list order/i);
+      });
     },
   );
+
+  it('accepts a story where target words appear in a different order from the input list', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      chatResponse(
+        JSON.stringify({
+          story:
+            'I bought a lovely [[souvenir|souvenir]] at the market. Then I [[run|ran]] home happily.',
+          translation: 'Saya membeli oleh-oleh indah di pasar. Lalu saya berlari pulang dengan gembira.',
+        }),
+      ),
+    );
+    vi.stubGlobal('fetch', fetchImpl);
+
+    const response = await handleGenerateStory(
+      requestBody({ targetWords: ['run', 'souvenir'], prompt: 'liburan' }),
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const body = (await response.json()) as { story: string };
+    expect(body.story).toContain('[[souvenir|souvenir]]');
+    expect(body.story).toContain('[[run|ran]]');
+  });
 
   it('rejects an empty targetWords array', async () => {
     const response = await handleGenerateStory(
