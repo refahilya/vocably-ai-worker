@@ -1,64 +1,80 @@
 import type { Env } from '../env';
 import { callChatCompletion, stripCodeFence, OpenAiCallError } from '../openai';
+import {
+  containsAnyTargetWord,
+  containsIndonesianWords,
+  containsTargetWordInText,
+  extractSuggestedSentence,
+  isBareOrFragmentTurn,
+  isEchoOfStudentTurn,
+  normalizeWord,
+  validateBotTargetWords,
+  validateStudentTargetWords,
+} from '../cowriteValidator';
 
 /**
  * `POST /cowrite-turn` (DATA_MODEL.md §10.2, SPEC.md §5.3) — Fase 3.
- * Not consumed by any Flutter screen yet (Milestone 7 builds that UI);
- * built now, to its full documented contract, alongside `/generate-story`
- * — see that file's doc comment for why.
+ * Consumed by `AiWorkerService.cowriteTurn` / `cowriteForcedTurn`
+ * (`lib/services/ai_worker_service.dart`), driven by
+ * `LearningFlowController.sendTurn` and `requestSuggestion`
+ * (`lib/providers/learning_session_controller.dart`).
  *
- * `hasError`/`wordsUsedCorrectly` are returned as **structured** fields,
- * not left for the client to infer from free-text feedback — this is
- * what directly feeds `learningSessions.cowriteWordsUsedCorrectly` and
- * the mastery-status calculation (DATA_MODEL.md §3/§4). The "mandiri"
- * rule (a turn written using "saran menulis" doesn't count toward
- * mastery) is enforced entirely on the Flutter side, per DATA_MODEL.md
- * §10.2 — this endpoint doesn't need to know about it.
+ * **Decision ownership.** The Flutter client owns every Co-Write
+ * decision: the consecutive-miss counter, whether the fallback is due,
+ * which single word is forced (random pick), word-status updates, and
+ * session completion. This endpoint owns only the prompt builders and the
+ * deterministic validation of model output. The model never chooses a
+ * target word, never counts turns, and never decides completion.
  *
- * Milestone 7 Phase 2 Stage 1 strengthened the `aiTurn` instructions:
- * exactly one sentence, a natural continuation of the story so far, and
- * never a sentence manufactured just to bait the student toward (or
- * force in) a remaining target word — those are the student's words to
- * use, not the AI's. This is prompt-only; the response shape and every
- * other field's behavior are unchanged.
+ * **Language.** The client decides (deterministic
+ * `containsIndonesianWords`) whether the student turn is Indonesian or
+ * mixed, and sends `studentTurnContainsIndonesian`; the model never makes
+ * that classification. When true, ordinary-turn feedback is one short,
+ * polite Indonesian reminder to write in English. Every `aiTurn` must be
+ * English and must stay in the story (never answering off-topic questions,
+ * calculations, or requests); an `aiTurn` that `containsIndonesianWords`
+ * flags is treated as a failed attempt and retried within the same limit.
  *
- * Milestone 7 Phase 2 Stage 6, also prompt-only, no schema change:
- *  - `aiTurn` now must connect *specifically* to the student's own most
- *    recent turn, not just the story's general theme (live testing found
- *    AI continuations that felt disconnected from what the student had
- *    actually just written) — Stage 1's anti-bait/anti-plot-jump wording
- *    is kept verbatim, this only adds to it.
- *  - `feedback` is no longer tied exclusively to `hasError` — the
- *    original "only when there's an error, otherwise null" condition
- *    meant most turns (anything grammatically fine) got no feedback at
- *    all, which live testing surfaced as "feedback is missing entirely."
- *    No plumbing bug was found on either the Worker or Flutter side (the
- *    response field, its parsing, and its rendering in `cowrite_screen.
- *    dart` were all already correct and unchanged) — this was a
- *    too-narrow trigger condition, not a disconnected pipeline, so the
- *    fix is broadening when the model is asked to say *something*, not
- *    adding a new field or a new client-side mechanism.
+ * The request selects exactly one of three modes:
  *
- * Milestone 7 Phase 2 Stage 8:
- *  - `wordsUsedCorrectly` (step 1) now explicitly excludes a bare word or
- *    a verbless fragment — live testing found a lone "baby" being
- *    reported as correctly used, which shouldn't count as productive
- *    vocabulary use. Prompt-only; still an EFL-appropriate bar (a short,
- *    simple, valid sentence is enough — no advanced grammar demanded).
- *  - New 3-turn AI fallback (step 2's added paragraph): if the student
- *    has completed more than 3 turns without using a remaining target
- *    word, the AI may use exactly one remaining word itself once, to
- *    help the student see it in context. The student-turn count is
- *    derived by the model directly from the `transcript` it already
- *    receives (counting "siswa" entries) — no new request field was
- *    added for this, per the Stage 8 investigation's conclusion that the
- *    transcript already carries everything needed.
- *  - New response field `aiUsedWords: string[]` — the CowriteTurnResult
- *    interface's own doc comment explains why this must stay a separate
- *    field from `wordsUsedCorrectly`, not merged into it: the "mandiri"/
- *    mastery pipeline downstream must never treat AI-assisted usage as
- *    student mastery, and merging the fields would make that
- *    unrecoverable on the client side.
+ *  1. **Ordinary turn** (`requestSuggestion: false`, no `forcedWord`):
+ *     assesses ONLY the current (latest) student turn — sent to the model
+ *     as a separate `currentStudentTurn` field, apart from the story
+ *     context, so feedback cannot drift onto an older message — and writes
+ *     one continuation sentence that must not use any remaining target
+ *     word. `wordsUsedCorrectly` is re-validated in code
+ *     (`validateStudentTargetWords`). `aiUsedWords` is always `[]`: an
+ *     ordinary AI turn never completes a target word, even if it happens
+ *     to contain one. Up to 2 generations; a retry is made when the reply
+ *     is malformed, empty, echoes the student, contains a remaining
+ *     target word, or is Indonesian. If no attempt yields an acceptable
+ *     `aiTurn`, the request fails with 502 — an unacceptable continuation
+ *     is never returned just because its JSON was well-formed. The
+ *     student-turn assessment (`feedback`, `hasError`,
+ *     `wordsUsedCorrectly`) is taken from the FIRST well-formed attempt
+ *     and kept: a retry only replaces `aiTurn`, so it can never erase a
+ *     student's vocabulary credit. Vocabulary credit means meaningful use
+ *     with an acceptable intended meaning — grammar/tense/inflection errors
+ *     are reported via `hasError`/`feedback`, not by withholding credit.
+ *     Feedback (CW-02) is about the current turn's target-word use first
+ *     (credited use → specific acknowledgement; attempted but uncredited →
+ *     the real issue; none → a gentle nudge), with at most one important
+ *     grammar/meaning point; capitalization/punctuation/apostrophes are
+ *     ignored. When the model claimed words but code credited none, its
+ *     feedback is replaced by `UNCREDITED_CLAIM_FEEDBACK`.
+ *     `assessedStudentTurn` echoes the exact student text
+ *     that was assessed, so the client can verify the association.
+ *  2. **Forced-word turn** (`forcedWord` set): the client has decided the
+ *     fallback is due and chosen the word. The model writes one
+ *     continuation sentence that uses exactly that word. The Worker
+ *     accepts it only if the word actually occurs in `aiTurn` (whole word
+ *     or inflection), no other remaining target word occurs, and it is not
+ *     an echo; otherwise it retries once, then fails with 502 — it never
+ *     reports an unvalidated word as used.
+ *  3. **Suggestion** (`requestSuggestion: true`): returns one bare English
+ *     sentence in `suggestion` (instruction prefixes/quotes stripped in
+ *     code). The Indonesian wrapper ("Coba tulis \"...\"") is added by the
+ *     client. No assessment, no `aiTurn` (returned as `""`).
  */
 
 interface RawTranscriptTurn {
@@ -66,10 +82,18 @@ interface RawTranscriptTurn {
   text?: unknown;
 }
 
+interface TranscriptTurn {
+  sender: 'siswa' | 'ai';
+  text: string;
+}
+
 interface CowriteTurnRequestBody {
   transcript?: unknown;
   remainingWords?: unknown;
   requestSuggestion?: unknown;
+  forcedWord?: unknown;
+  /** App-decided (client `containsIndonesianWords`); optional, default false. */
+  studentTurnContainsIndonesian?: unknown;
 }
 
 interface CowriteTurnResult {
@@ -79,31 +103,94 @@ interface CowriteTurnResult {
   wordsUsedCorrectly: string[];
   suggestion: string | null;
   /**
-   * Milestone 7 Phase 2 Stage 8 (3-turn fallback): remaining target
-   * words the AI itself used in this response's `aiTurn` — semantically
-   * distinct from `wordsUsedCorrectly` (which is exclusively the
-   * student's own usage). Empty whenever no fallback target was used
-   * this turn (the normal case). The client unions this into
-   * `allWordsUsedCorrectly` (so Cowrite can still end) but never into
-   * `independentWordsUsedCorrectly` (so it can never count as student
-   * mastery) — see `learning_session_controller.dart`'s `sendTurn()`.
+   * Target words the AI's `aiTurn` validly used. Only ever non-empty in
+   * forced-word mode, where it is exactly `[forcedWord]` after
+   * deterministic validation. Ordinary turns always return `[]`. The
+   * client counts it toward session-level usage only — never toward
+   * independent student mastery.
    */
   aiUsedWords: string[];
+  /** The exact student text that was assessed (ordinary mode), else null. */
+  assessedStudentTurn: string | null;
 }
 
-const SYSTEM_PROMPT = `You are the AI co-writing partner in an English vocabulary-learning app aimed at Indonesian students (Storyfier method, UIST '23, "co-write" phase). A student and you take turns writing sentences together to build one short story, trying to use a list of target English words.
+/** Bounded generation strategy: first attempt + one retry. */
+export const MAX_GENERATION_ATTEMPTS = 2;
 
-You will receive: the conversation transcript so far (alternating "siswa"/student and "ai" turns), the list of target words (base form) NOT YET used correctly, and whether the student just asked for a writing suggestion.
+const SHARED_CONTEXT = `You are the AI co-writing partner in an English vocabulary-learning app for Indonesian students (Storyfier method, "co-write" phase). The student and you take turns adding sentences to one short shared story, written in English. The app (not you) tracks the target words, decides when you must use one, and decides when the session ends. You are only a story co-writer, not a general assistant: never answer questions, calculations, or requests that are not part of the story.`;
 
-Do the following, in order:
-1. Look at the student's most recent turn (the last "siswa" entry in the transcript). Decide if it contains a grammar or spelling error (hasError). Always write a short, friendly comment in Indonesian about that turn (feedback) — if hasError is true, gently point out and briefly explain the correction; if it's correct, give brief encouraging feedback about what they wrote (e.g. praising a good word choice or a natural sentence). feedback should only be null if the student's turn is empty or there is truly nothing to comment on. List which of the remaining target words that turn used correctly, in a grammatically valid way (wordsUsedCorrectly — base form, exact spelling matching the target word list given). A target word only counts here if the student actually used it inside a real sentence or a meaningful clause — a bare word or short fragment by itself (e.g. just "baby", or "baby!", or "the baby" with no verb/predicate) does NOT count, even if correctly spelled, because it doesn't demonstrate the student can actually use the word, not just name it. This does not need to be sophisticated English — a short, simple, grammatically valid sentence is enough (e.g. "Baby sleeps." or "My baby is sleeping." both count); do not require advanced vocabulary or complex grammar, this is an EFL learner app.
+const CONTINUATION_RULES = `Rules for your story turn (aiTurn):
+- Write aiTurn in ENGLISH ONLY — even when the student writes in Indonesian or mixes Indonesian and English. Never reply in Indonesian and never mirror the student's language.
+- EXACTLY one sentence, no more.
+- Continue the story with a NEW event, action, reaction, or detail that moves it forward — the next thing that happens in the story.
+- When currentStudentTurn is part of the story, connect directly to it — build on their specific idea, action, or detail.
+- When currentStudentTurn is NOT part of the story (a question, a calculation, a request, a command to you, or chatter), do NOT answer, solve, or address it — continue the story from storySoFar instead.
+- Do NOT repeat, paraphrase, summarize, or restate the student's sentence, and do not start by echoing it.
+- Follow naturally from what has already happened in storySoFar: no arbitrary plot jumps, no sudden unrelated characters or settings, no unnatural transitions.
+- Never manufacture a "bait" sentence whose only purpose is to set up an opening for the student to use a target word.`;
 
-2. Write your own next turn continuing the story (aiTurn) — EXACTLY one sentence, no more. It must connect directly to what the student just wrote in their most recent turn — respond to or build on their specific idea, action, or detail, not just the story's general theme, and never ignore what they just wrote. It must also follow naturally from what has already happened in the transcript so far: no arbitrary plot jumps, no sudden new characters or settings, no unnatural transitions just to change the subject. Never manufacture a "bait" sentence whose only purpose is to set up an opening for the student to use a remaining target word, and never force any of the remaining target words into your own sentence — those words are for the student to use, not you. Just continue the story naturally, as if the remaining target words did not exist — UNLESS the fallback rule below applies.
+const ORDINARY_SYSTEM_PROMPT = `${SHARED_CONTEXT}
 
-Fallback rule (use sparingly, only when it applies): count how many "siswa" entries appear in the transcript you were given, including the student's latest turn — this is how many turns the student has completed so far. If that count is MORE THAN 3 (i.e. the student has already completed at least 3 turns) AND remainingWords is not empty, you MAY use exactly ONE of the remainingWords naturally and correctly in this aiTurn, instead of avoiding all of them as instructed above — this is a deliberate exception meant to help a student who hasn't managed to use a word after several chances, by showing it used in context. Never do this before the student has completed at least 3 turns, and never use more than one remaining target word in the same aiTurn even if several remain. If you used a remaining target word in aiTurn this turn under this fallback rule, list it in aiUsedWords (base form, exact spelling matching remainingWords). If you did not use any remaining target word this turn (the normal case, including every turn before the student's 3rd), aiUsedWords must be an empty array — never list a word there that doesn't actually appear (in some form) in this turn's aiTurn, and never list one merely because it appeared earlier in the transcript.
-3. If requestSuggestion is true, write one natural English sentence the student could write next, using one of the remaining target words (suggestion). Otherwise suggestion must be null.
+You will receive JSON with: storySoFar (earlier turns, oldest first, for context only; sender "siswa" is the student and "ai" is you), currentStudentTurn (the ONE sentence you must assess now), remainingTargetWords, and studentTurnContainsIndonesian (decided by the app, not by you: true when currentStudentTurn is written fully or partly in Indonesian).
 
-Respond with ONLY a JSON object (no markdown fences, no commentary): {"aiTurn": "...", "feedback": "..." or null, "hasError": true or false, "wordsUsedCorrectly": ["..."], "suggestion": "..." or null, "aiUsedWords": ["..."]}.`;
+1. Assess ONLY currentStudentTurn — never an earlier turn from storySoFar, never your own aiTurn, never the story as a whole, and never details that are not in currentStudentTurn. This is a vocabulary-learning app: the student's use of remainingTargetWords matters most, more than grammar.
+   - wordsUsedCorrectly (decide this first): the remainingTargetWords (list each in its base form, exactly as written in remainingTargetWords) that currentStudentTurn uses MEANINGFULLY, with an acceptable intended meaning, inside a sentence or clause that expresses an idea. This judges vocabulary use, not grammar:
+     - Grammar, tense, and subject-verb agreement errors in the sentence do NOT by themselves disqualify a target word.
+     - A wrong inflection of the target word itself does NOT disqualify it when the intended meaning is clear and acceptable (e.g. "Yesterday the monster attack the village." and "The monsters attacks the village." both count for "attack").
+     - Such errors may be reported through hasError and feedback (see below); they must never remove the word from wordsUsedCorrectly.
+     - Do NOT count: a bare word, a list of words, or a fragment that expresses no idea (e.g. "attack", "attack, button, ability", "the button"); a mere mention of the word instead of a use (e.g. "I do not know the word attack."); nonsense; or a use whose meaning is wrong or unacceptable in context.
+     - Never list a word that does not appear in currentStudentTurn.
+   - hasError: true only if currentStudentTurn has an IMPORTANT problem: a target word used in a wrong form or with a wrong or unclear meaning, or a grammar or word-choice error that changes the meaning or makes the sentence hard to understand. Capitalization, punctuation, apostrophes, and small slips that do not change the meaning are NOT important problems: ignore them, and never mention them in feedback. Do not invent mistakes.
+   - feedback: 1–2 short sentences in Indonesian about currentStudentTurn only. Use the FIRST case that applies:
+     a. A target word is in wordsUsedCorrectly: name that word and say specifically what was good about how it was used. If hasError is true, add one brief correction of the important problem, quoting the corrected English (e.g. Seharusnya "attacked" karena kejadiannya sudah lampau.).
+     b. The student tried to use a target word but it is NOT in wordsUsedCorrectly: briefly explain the real issue with that word (e.g. it is only mentioned, or its meaning does not fit) and how to fix it.
+     c. No target word is used: give a gentle, actionable nudge to use one of remainingTargetWords in the next sentence (e.g. Coba pakai kata "souvenir" di kalimat berikutnya, ya.). If hasError is true, you may add one brief correction of the important problem.
+     - Mention at most ONE grammar or meaning problem, and only an important one. Never give a list of corrections, and never let a grammar correction replace the vocabulary point.
+     - Never say a target word was used correctly unless it is in your wordsUsedCorrectly. No generic praise (e.g. "Bagus!", "Kalimat yang menarik.") without a specific vocabulary point.
+     EXCEPTION — when studentTurnContainsIndonesian is true: feedback must be exactly ONE short, polite sentence in Indonesian reminding the student to write their sentence in English (e.g. "Coba tulis kalimatmu dalam bahasa Inggris, ya."). No grammar lesson, no correction list, and no praise in that case.
+
+2. Write aiTurn.
+${CONTINUATION_RULES}
+- Do NOT use any word from remainingTargetWords (in any form) — those words are for the student to use.
+
+Respond with ONLY a JSON object (no markdown fences, no commentary): {"wordsUsedCorrectly": ["..."], "hasError": true or false, "feedback": "..." or null, "aiTurn": "..."}.`;
+
+/**
+ * Deterministic replacement feedback for a contradiction the model cannot
+ * be trusted to avoid: it claimed target-word use (so its feedback likely
+ * praises it), but code validation credited nothing. Mirrored verbatim by
+ * the Flutter client (`kCowriteUncreditedClaimFeedback` in
+ * `lib/utils/cowrite_feedback.dart`), which applies the same rule.
+ */
+export const UNCREDITED_CLAIM_FEEDBACK =
+  'Belum ada kata target yang terhitung di kalimat ini. Coba pakai salah satu kata target yang belum terpakai dalam kalimat lengkap yang bermakna, ya.';
+
+function forcedSystemPrompt(forcedWord: string, avoidWords: readonly string[]): string {
+  const avoid =
+    avoidWords.length > 0
+      ? `- Do NOT use any of these other words (in any form): ${avoidWords.map((w) => `"${w}"`).join(', ')}.`
+      : '';
+  return `${SHARED_CONTEXT}
+
+The app has decided that in this turn you must model the target word "${forcedWord}" for the student.
+
+You will receive JSON with: storySoFar (earlier turns, oldest first) and currentStudentTurn (the student's latest sentence).
+
+Write aiTurn.
+${CONTINUATION_RULES}
+- aiTurn MUST use the word "${forcedWord}" (base form or a correct grammatical form of it) exactly as a fluent writer would, with its correct meaning, as a natural part of the continuation.
+${avoid}
+
+Respond with ONLY a JSON object (no markdown fences, no commentary): {"aiTurn": "..."}.`;
+}
+
+const SUGGESTION_SYSTEM_PROMPT = `${SHARED_CONTEXT}
+
+The student asked for a writing suggestion for their next turn. You will receive JSON with: storySoFar (all turns so far, oldest first) and remainingTargetWords.
+
+Write ONE simple, natural English sentence the student could write next: it continues the story from the last turn and uses exactly one of remainingTargetWords correctly. Return ONLY the English sentence itself — no instruction words (no "Try to write", "You could write", "Coba tulis"), no quotes, no explanation.
+
+Respond with ONLY a JSON object (no markdown fences, no commentary): {"suggestion": "..."}.`;
 
 export async function handleCowriteTurn(request: Request, env: Env): Promise<Response> {
   let body: CowriteTurnRequestBody;
@@ -128,27 +215,43 @@ export async function handleCowriteTurn(request: Request, env: Env): Promise<Res
   if (typeof body.requestSuggestion !== 'boolean') {
     return jsonError('"requestSuggestion" is required and must be a boolean.', 400);
   }
+  if (body.forcedWord !== undefined && body.forcedWord !== null && typeof body.forcedWord !== 'string') {
+    return jsonError('"forcedWord" must be a string when provided.', 400);
+  }
+  if (
+    body.studentTurnContainsIndonesian !== undefined &&
+    typeof body.studentTurnContainsIndonesian !== 'boolean'
+  ) {
+    return jsonError('"studentTurnContainsIndonesian" must be a boolean when provided.', 400);
+  }
 
-  const userContent = JSON.stringify({
-    transcript: body.transcript,
-    remainingWords: body.remainingWords,
-    requestSuggestion: body.requestSuggestion,
-  });
+  const transcript = body.transcript;
+  const studentTurnContainsIndonesian = body.studentTurnContainsIndonesian === true;
+  const remainingWords = body.remainingWords.map(normalizeWord).filter((w) => w.length > 0);
+  const forcedWord = typeof body.forcedWord === 'string' ? normalizeWord(body.forcedWord) : null;
 
   try {
-    const content = await callChatCompletion(
-      env,
-      [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userContent },
-      ],
-      { temperature: 0.7 },
-    );
-    const parsed = JSON.parse(stripCodeFence(content)) as Partial<CowriteTurnResult>;
-    if (!isValidResult(parsed)) {
-      return jsonError('AI backend returned an unexpected response shape.', 502);
+    if (forcedWord !== null) {
+      if (body.requestSuggestion) {
+        return jsonError('"forcedWord" cannot be combined with "requestSuggestion".', 400);
+      }
+      if (!remainingWords.includes(forcedWord)) {
+        return jsonError('"forcedWord" must be one of "remainingWords".', 400);
+      }
+      const split = splitAtCurrentStudentTurn(transcript);
+      if (!split) {
+        return jsonError('A forced-word turn requires a student turn in "transcript".', 400);
+      }
+      return await forcedTurn(env, split, forcedWord, remainingWords);
     }
-    return Response.json(parsed);
+    if (body.requestSuggestion) {
+      return await suggestionTurn(env, transcript, remainingWords);
+    }
+    const split = splitAtCurrentStudentTurn(transcript);
+    if (!split) {
+      return jsonError('"transcript" must end with the current student turn.', 400);
+    }
+    return await ordinaryTurn(env, split, remainingWords, studentTurnContainsIndonesian);
   } catch (err) {
     if (err instanceof OpenAiCallError) {
       return jsonError(err.message, 502);
@@ -157,23 +260,230 @@ export async function handleCowriteTurn(request: Request, env: Env): Promise<Res
   }
 }
 
-function isValidTurn(turn: unknown): turn is { sender: 'siswa' | 'ai'; text: string } {
+interface SplitTranscript {
+  storySoFar: TranscriptTurn[];
+  currentStudentTurn: string;
+}
+
+/**
+ * The current student turn is, by contract, the LAST transcript entry and
+ * must be from the student — the client appends it right before calling.
+ * Anything else means the client's transcript assembly is out of sync, so
+ * it is rejected rather than assessing some older student message.
+ */
+function splitAtCurrentStudentTurn(transcript: readonly TranscriptTurn[]): SplitTranscript | null {
+  const last = transcript[transcript.length - 1];
+  if (!last || last.sender !== 'siswa' || !last.text.trim()) return null;
+  return { storySoFar: transcript.slice(0, -1), currentStudentTurn: last.text };
+}
+
+async function ordinaryTurn(
+  env: Env,
+  split: SplitTranscript,
+  remainingWords: readonly string[],
+  studentTurnContainsIndonesian: boolean,
+): Promise<Response> {
+  const userContent = JSON.stringify({
+    storySoFar: split.storySoFar,
+    currentStudentTurn: split.currentStudentTurn,
+    remainingTargetWords: remainingWords,
+    studentTurnContainsIndonesian,
+  });
+
+  // The student-turn assessment (feedback, hasError, wordsUsedCorrectly)
+  // comes from the FIRST well-formed attempt and is kept for the whole
+  // request: a retry exists only to repair the bot's aiTurn, so it must
+  // never replace (or silently erase) the student's vocabulary credit.
+  let assessment: Pick<CowriteTurnResult, 'feedback' | 'hasError' | 'wordsUsedCorrectly'> | null =
+    null;
+  for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
+    const parsed = await generateJson(env, ORDINARY_SYSTEM_PROMPT, userContent, 0.7);
+    if (!isValidOrdinaryOutput(parsed)) continue;
+
+    if (assessment === null) {
+      const wordsUsedCorrectly = validateStudentTargetWords(
+        parsed.wordsUsedCorrectly,
+        split.currentStudentTurn,
+        remainingWords,
+      );
+      const modelFeedback =
+        typeof parsed.feedback === 'string' ? parsed.feedback.trim() || null : null;
+      // The model claimed target-word use but code credited none, so its
+      // feedback would contradict the validated result (e.g. praising a
+      // bare word). The Indonesian-reminder case is left untouched.
+      const claimedButUncredited =
+        parsed.wordsUsedCorrectly.some((w) => w.trim().length > 0) &&
+        wordsUsedCorrectly.length === 0;
+      assessment = {
+        feedback:
+          claimedButUncredited && !studentTurnContainsIndonesian
+            ? UNCREDITED_CLAIM_FEEDBACK
+            : modelFeedback,
+        hasError: parsed.hasError,
+        wordsUsedCorrectly,
+      };
+    }
+    const credited = assessment.wordsUsedCorrectly;
+    const stillRemaining = remainingWords.filter((w) => !credited.includes(w));
+    const aiTurn = parsed.aiTurn.trim();
+
+    const acceptable =
+      aiTurn.length > 0 &&
+      !isEchoOfStudentTurn(aiTurn, split.currentStudentTurn) &&
+      !containsAnyTargetWord(aiTurn, stillRemaining) &&
+      !containsIndonesianWords(aiTurn, remainingWords);
+    if (!acceptable) continue;
+
+    const result: CowriteTurnResult = {
+      aiTurn,
+      ...assessment,
+      suggestion: null,
+      aiUsedWords: [],
+      assessedStudentTurn: split.currentStudentTurn,
+    };
+    return Response.json(result);
+  }
+
+  // No attempt produced an acceptable continuation. A well-formed but
+  // unacceptable aiTurn (echo, remaining target word, Indonesian) is never
+  // shown; the client rolls the student turn back and the student resends.
+  return jsonError(
+    assessment === null
+      ? 'AI backend returned an unexpected response shape.'
+      : 'AI did not produce an acceptable story continuation.',
+    502,
+  );
+}
+
+async function forcedTurn(
+  env: Env,
+  split: SplitTranscript,
+  forcedWord: string,
+  remainingWords: readonly string[],
+): Promise<Response> {
+  const avoidWords = remainingWords.filter((w) => w !== forcedWord);
+  const systemPrompt = forcedSystemPrompt(forcedWord, avoidWords);
+  const userContent = JSON.stringify({
+    storySoFar: split.storySoFar,
+    currentStudentTurn: split.currentStudentTurn,
+  });
+
+  for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
+    const parsed = await generateJson(env, systemPrompt, userContent, 0.7);
+    if (!isRecord(parsed) || typeof parsed.aiTurn !== 'string') continue;
+    const aiTurn = parsed.aiTurn.trim();
+
+    const usesForcedWord = containsTargetWordInText(aiTurn, forcedWord);
+    const usesOtherTargets = containsAnyTargetWord(aiTurn, avoidWords);
+    const echoes = isEchoOfStudentTurn(aiTurn, split.currentStudentTurn);
+    const notEnglish = containsIndonesianWords(aiTurn, remainingWords);
+    if (!aiTurn || !usesForcedWord || usesOtherTargets || echoes || notEnglish) continue;
+
+    const result: CowriteTurnResult = {
+      aiTurn,
+      feedback: null,
+      hasError: false,
+      wordsUsedCorrectly: [],
+      suggestion: null,
+      aiUsedWords: validateBotTargetWords([], aiTurn, [forcedWord]),
+      assessedStudentTurn: null,
+    };
+    return Response.json(result);
+  }
+
+  return jsonError(`AI did not produce a valid turn using "${forcedWord}".`, 502);
+}
+
+async function suggestionTurn(
+  env: Env,
+  transcript: readonly TranscriptTurn[],
+  remainingWords: readonly string[],
+): Promise<Response> {
+  const userContent = JSON.stringify({
+    storySoFar: transcript,
+    remainingTargetWords: remainingWords,
+  });
+
+  let fallback: string | null = null;
+  for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
+    const parsed = await generateJson(env, SUGGESTION_SYSTEM_PROMPT, userContent, 0.7);
+    if (!isRecord(parsed) || typeof parsed.suggestion !== 'string') continue;
+    const sentence = extractSuggestedSentence(parsed.suggestion);
+    if (!sentence) continue;
+    fallback = sentence;
+    if (
+      containsAnyTargetWord(sentence, remainingWords) &&
+      !isBareOrFragmentTurn(sentence, remainingWords)
+    ) {
+      break;
+    }
+  }
+
+  if (fallback === null) {
+    return jsonError('AI backend returned an unexpected response shape.', 502);
+  }
+  const result: CowriteTurnResult = {
+    aiTurn: '',
+    feedback: null,
+    hasError: false,
+    wordsUsedCorrectly: [],
+    suggestion: fallback,
+    aiUsedWords: [],
+    assessedStudentTurn: null,
+  };
+  return Response.json(result);
+}
+
+/** One model call; returns the parsed JSON, or `undefined` when the reply
+ * is not valid JSON (treated by callers as a failed attempt). Network/HTTP
+ * failures propagate as `OpenAiCallError` (502, no retry). */
+async function generateJson(
+  env: Env,
+  systemPrompt: string,
+  userContent: string,
+  temperature: number,
+): Promise<unknown> {
+  const content = await callChatCompletion(
+    env,
+    [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent },
+    ],
+    { temperature },
+  );
+  try {
+    return JSON.parse(stripCodeFence(content));
+  } catch {
+    return undefined;
+  }
+}
+
+interface OrdinaryOutput {
+  feedback: string | null;
+  hasError: boolean;
+  wordsUsedCorrectly: string[];
+  aiTurn: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isValidOrdinaryOutput(value: unknown): value is OrdinaryOutput {
+  return (
+    isRecord(value) &&
+    typeof value.aiTurn === 'string' &&
+    (value.feedback === null || value.feedback === undefined || typeof value.feedback === 'string') &&
+    typeof value.hasError === 'boolean' &&
+    Array.isArray(value.wordsUsedCorrectly) &&
+    value.wordsUsedCorrectly.every((w) => typeof w === 'string')
+  );
+}
+
+function isValidTurn(turn: unknown): turn is TranscriptTurn {
   if (typeof turn !== 'object' || turn === null) return false;
   const t = turn as RawTranscriptTurn;
   return (t.sender === 'siswa' || t.sender === 'ai') && typeof t.text === 'string';
-}
-
-function isValidResult(value: Partial<CowriteTurnResult>): value is CowriteTurnResult {
-  return (
-    typeof value.aiTurn === 'string' &&
-    (value.feedback === null || typeof value.feedback === 'string') &&
-    typeof value.hasError === 'boolean' &&
-    Array.isArray(value.wordsUsedCorrectly) &&
-    value.wordsUsedCorrectly.every((w) => typeof w === 'string') &&
-    (value.suggestion === null || typeof value.suggestion === 'string') &&
-    Array.isArray(value.aiUsedWords) &&
-    value.aiUsedWords.every((w) => typeof w === 'string')
-  );
 }
 
 function jsonError(message: string, status: number): Response {
